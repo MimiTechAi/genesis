@@ -73,14 +73,20 @@ class GRUBlock(nn.Module):
 
 
 class GateBlock(nn.Module):
-    """Gated Linear Unit — element-wise gating."""
-    def __init__(self, in_dim, out_dim):
+    """SwiGLU-style gated MLP — the standard FFN in modern transformers (LLaMA, etc).
+    
+    Computes: down(silu(up(x)) * gate(x))
+    Uses 4x expansion factor for the hidden dimension.
+    """
+    def __init__(self, in_dim, out_dim, expansion=4):
         super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
-        self.gate = nn.Linear(in_dim, out_dim)
+        hidden = in_dim * expansion
+        self.up = nn.Linear(in_dim, hidden, bias=False)
+        self.gate_proj = nn.Linear(in_dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, out_dim, bias=False)
 
     def forward(self, x):
-        return self.proj(x) * torch.sigmoid(self.gate(x))
+        return self.down(F.silu(self.up(x)) * self.gate_proj(x))
 
 
 class MoERouter(nn.Module):
@@ -192,20 +198,11 @@ class EvolvedModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights following best practices."""
+        """Initialize weights following best practices (Karpathy-style)."""
         n_embd = self.genome.embedding_dim
         std = 1.0 / math.sqrt(n_embd)
 
-        # Embeddings
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=1.0)
-        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
-
-        # LM head (small init for stable start)
-        if not (self.genome.embedding_dim == self.layers[-1]
-                if not self.layers else True):
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-
-        # All linear layers
+        # All linear layers first (generic init)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -214,6 +211,14 @@ class EvolvedModel(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+
+        # Embeddings (override generic init)
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+
+        # LM head: small init for stable training start (unless weight-tied)
+        if self.lm_head.weight is not self.token_embedding.weight:
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
@@ -369,16 +374,19 @@ class Genome:
 
     @staticmethod
     def transformer_baseline(n_layers=4, dim=256) -> 'Genome':
-        """Create a standard transformer-like genome for baseline comparison."""
+        """Create a standard transformer-like genome for baseline comparison.
+        
+        Mimics Pre-LN Transformer: norm → attention → residual, norm → MLP → residual.
+        All dims stay constant to enable clean skip connections.
+        """
         genes = []
-        curr_dim = dim
         for _ in range(n_layers):
-            # Attention + MLP block (like a standard transformer layer)
-            genes.append(Gene('attention', curr_dim, curr_dim, 'none', True))  # attention + skip
-            genes.append(Gene('norm', curr_dim, curr_dim, 'none', False))      # post-attn norm
-            genes.append(Gene('linear', curr_dim, curr_dim * 2, 'gelu', False))  # MLP up
-            genes.append(Gene('linear', curr_dim * 2, curr_dim, 'none', True))   # MLP down + skip
-            genes.append(Gene('norm', curr_dim, curr_dim, 'none', False))        # post-MLP norm
+            # Pre-LN attention block
+            genes.append(Gene('norm', dim, dim, 'none', False))       # pre-norm
+            genes.append(Gene('attention', dim, dim, 'none', True))   # attention + residual
+            # Pre-LN MLP block
+            genes.append(Gene('norm', dim, dim, 'none', False))       # pre-norm
+            genes.append(Gene('gate', dim, dim, 'none', True))        # SwiGLU MLP + residual
         return Genome(genes, dim)
 
     def count_parameters(self) -> int:

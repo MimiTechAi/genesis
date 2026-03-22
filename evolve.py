@@ -117,11 +117,12 @@ def train_and_evaluate(genome: Genome, tokenizer, train_loader, device):
         torch.cuda.empty_cache()
 
 
-def save_checkpoint(generation, population, history):
+def save_checkpoint(generation, population, history, baseline_bpb=None):
     """Save full state for resume capability."""
     data = {
         "generation": generation,
         "seed": SEED,
+        "baseline_bpb": baseline_bpb,
         "config": {
             "population_size": POPULATION_SIZE,
             "survivors": SURVIVORS,
@@ -154,12 +155,13 @@ def load_checkpoint():
             data = json.load(f)
         gen = data["generation"]
         history = data["history"]
+        baseline_bpb = data.get("baseline_bpb", None)
         population = [
             (Genome.from_dict(d["genome"]), d["fitness"], d["params"])
             for d in data["population"]
         ]
-        return gen, population, history
-    return 0, [], []
+        return gen, population, history, baseline_bpb
+    return 0, [], [], None
 
 
 def update_plot(history):
@@ -177,8 +179,12 @@ def update_plot(history):
     ax.fill_between(gens, best, avg, alpha=0.1, color='#58a6ff')
 
     # Add baseline line if we have it
-    if "baseline_bpb" in history[0]:
-        baseline = history[0]["baseline_bpb"]
+    baseline = None
+    for h in history:
+        if h.get("baseline_bpb") is not None:
+            baseline = h["baseline_bpb"]
+            break
+    if baseline is not None:
         ax.axhline(y=baseline, color='#f85149', linestyle=':', linewidth=1.5,
                    label=f'Transformer baseline ({baseline:.3f})')
 
@@ -222,11 +228,10 @@ def main():
     tokenizer = prepare.Tokenizer.from_directory()
     train_loader = prepare.make_dataloader(tokenizer, BATCH_SIZE, prepare.MAX_SEQ_LEN, "train")
 
-    start_gen, population, history = load_checkpoint()
+    start_gen, population, history, baseline_bpb = load_checkpoint()
 
-    # Run transformer baseline first
-    baseline_bpb = None
-    if not history:
+    # Run transformer baseline first (or restore from checkpoint)
+    if baseline_bpb is None:
         baseline_bpb = run_baseline(tokenizer, train_loader, device)
         console.print(f"\n[bold]Baseline established: {baseline_bpb:.4f} val_bpb[/bold]\n")
 
@@ -275,11 +280,10 @@ def main():
             best_g = new_population[0][0]
             writer.writerow([gen, f"{best_fit:.6f}", f"{avg_fit:.6f}",
                            f"{new_population[0][2]}", best_g.summary(),
-                           f"{baseline_bpb:.6f}" if baseline_bpb else ""])
+                           f"{baseline_bpb:.6f}"])
 
-        entry = {"generation": gen, "best_val_bpb": best_fit, "avg_val_bpb": avg_fit}
-        if baseline_bpb:
-            entry["baseline_bpb"] = baseline_bpb
+        entry = {"generation": gen, "best_val_bpb": best_fit, "avg_val_bpb": avg_fit,
+                 "baseline_bpb": baseline_bpb}
         history.append(entry)
 
         update_plot(history)
@@ -313,7 +317,7 @@ def main():
             next_gen.append((child, float('inf'), 0))
 
         population = next_gen
-        save_checkpoint(gen + 1, new_population, history)
+        save_checkpoint(gen + 1, new_population, history, baseline_bpb)
 
 
 if __name__ == "__main__":
