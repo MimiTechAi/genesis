@@ -8,7 +8,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.table import Table
@@ -18,29 +19,37 @@ from genome import Genome
 import prepare
 
 # Configuration
-POPULATION_SIZE = 20
-SURVIVORS = 5
+POPULATION_SIZE = 12
+SURVIVORS = 3
 MUTATION_RATE = 0.3
 CROSSOVER_RATE = 0.5
-TIME_BUDGET = 60 # seconds per genome training
+TIME_BUDGET = 30          # seconds per genome training
 MAX_PARAMS = 10_000_000
-MAX_GENERATIONS = 1000
-BATCH_SIZE = 16
+MAX_GENERATIONS = 25
+BATCH_SIZE = 8             # smaller for diverse small architectures
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
+EVAL_STEPS = 10            # quick eval (not full 20M tokens)
 
 console = Console()
 
 def train_genome(genome: Genome, tokenizer, train_loader, device):
-    model = genome.build().to(device)
+    try:
+        model = genome.build().to(device)
+    except Exception as e:
+        console.print(f"[red]Build failed: {e}[/red]")
+        return float('inf'), 0
+    
     param_count = sum(p.numel() for p in model.parameters())
     
     if param_count > MAX_PARAMS:
+        console.print(f"[yellow]Skipped: {param_count/1e6:.1f}M params > {MAX_PARAMS/1e6:.0f}M limit[/yellow]")
+        del model; torch.cuda.empty_cache()
         return float('inf'), param_count
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler("cuda")
     
     model.train()
     start_time = time.time()
@@ -50,16 +59,19 @@ def train_genome(genome: Genome, tokenizer, train_loader, device):
         while time.time() - start_time < TIME_BUDGET:
             x, y, epoch = next(train_loader)
             
-            # Simple Cosine Decay based on steps (we don't know total steps, so we use a large constant or time-based)
-            # For 60s training, let's just use a fixed small LR or a very simple schedule
             lr = LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * (time.time() - start_time) / TIME_BUDGET))
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
                 
             optimizer.zero_grad(set_to_none=True)
             
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 loss = model(x, y)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                console.print(f"[red]NaN/Inf loss at step {steps}[/red]")
+                del model; del optimizer; torch.cuda.empty_cache()
+                return float('inf'), param_count
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -68,14 +80,27 @@ def train_genome(genome: Genome, tokenizer, train_loader, device):
             scaler.update()
             
             steps += 1
-            
-        # Evaluation
+        
+        # Quick evaluation (not full prepare.evaluate_bpb — too slow for evolution)
         model.eval()
-        val_bpb = prepare.evaluate_bpb(model, tokenizer, BATCH_SIZE)
+        val_loader = prepare.make_dataloader(tokenizer, BATCH_SIZE, prepare.MAX_SEQ_LEN, "val")
+        total_loss = 0.0
+        with torch.no_grad():
+            for _ in range(EVAL_STEPS):
+                x, y, _ = next(val_loader)
+                with torch.amp.autocast('cuda'):
+                    loss = model(x, y)
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / EVAL_STEPS
+        # Convert cross-entropy loss to approximate BPB (nats -> bits, token-level)
+        val_bpb = avg_loss / math.log(2)
+        
+        console.print(f"[green]  {steps} steps, val_bpb≈{val_bpb:.4f}, {param_count/1e6:.2f}M params[/green]")
         return val_bpb, param_count
         
     except Exception as e:
-        console.print(f"[red]Error training genome: {e}[/red]")
+        console.print(f"[red]Training error: {e}[/red]")
         return float('inf'), param_count
     finally:
         del model

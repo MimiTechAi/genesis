@@ -31,7 +31,9 @@ class CausalConv1d(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim, num_heads=4):
         super().__init__()
-        assert dim % num_heads == 0
+        # Fallback to 1 head if dim not divisible
+        if dim % num_heads != 0:
+            num_heads = 1
         self.num_heads = num_heads
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
@@ -285,15 +287,22 @@ class Genome:
     def random(max_depth=8, embedding_dim=256) -> 'Genome':
         ops = ['linear', 'conv1d', 'attention', 'gru', 'identity', 'gate', 'norm', 'moe_router']
         acts = ['relu', 'gelu', 'silu', 'tanh', 'none']
-        dims = [64, 128, 256, 512]
+        dims = [64, 128, 256, 512]  # all divisible by 4 for attention heads
         
         depth = random.randint(2, max_depth)
         genes = []
         curr_dim = embedding_dim
         for i in range(depth):
+            op = random.choice(ops)
             out_dim = random.choice(dims)
+            # Ensure attention dims are divisible by num_heads (4)
+            if op == 'attention':
+                while curr_dim % 4 != 0:
+                    curr_dim = random.choice(dims)
+                while out_dim % 4 != 0:
+                    out_dim = random.choice(dims)
             genes.append(Gene(
-                op=random.choice(ops),
+                op=op,
                 in_dim=curr_dim,
                 out_dim=out_dim,
                 activation=random.choice(acts),
