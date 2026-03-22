@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+results/
+*.png
+best_genome.json
+results.tsv
+results.json
+checkpoint.json
+run*.log
