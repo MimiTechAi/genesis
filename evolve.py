@@ -1,3 +1,9 @@
+"""
+genesis — Neural Architecture Evolution
+
+Evolution engine: evaluate → select → mutate → repeat.
+Uses the same data pipeline and eval metric (val_bpb) as autoresearch/nanochat.
+"""
 import os
 import time
 import json
@@ -18,216 +24,285 @@ from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn
 from genome import Genome
 import prepare
 
+# ---------------------------------------------------------------------------
 # Configuration
-POPULATION_SIZE = 12
-SURVIVORS = 3
-MUTATION_RATE = 0.3
-CROSSOVER_RATE = 0.5
-TIME_BUDGET = 30          # seconds per genome training
-MAX_PARAMS = 10_000_000
-MAX_GENERATIONS = 25
-BATCH_SIZE = 8             # smaller for diverse small architectures
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 0.1
-GRAD_CLIP = 1.0
-EVAL_STEPS = 10            # quick eval (not full 20M tokens)
+# ---------------------------------------------------------------------------
+POPULATION_SIZE = 20       # genomes per generation
+SURVIVORS = 5              # top-k survive (elitism)
+MUTATION_RATE = 0.3        # per-gene mutation probability
+CROSSOVER_RATE = 0.5       # crossover vs mutation for offspring
+TIME_BUDGET = 60           # seconds of training per genome
+MAX_PARAMS = 10_000_000    # parameter ceiling
+MAX_GENERATIONS = 200      # stop after N generations
+BATCH_SIZE = 8             # per-genome training batch size
+LEARNING_RATE = 3e-4       # AdamW learning rate
+WEIGHT_DECAY = 0.1         # AdamW weight decay
+GRAD_CLIP = 1.0            # gradient clipping norm
+WARMUP_FRAC = 0.1          # fraction of time budget for LR warmup
+SEED = 42                  # reproducibility
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 console = Console()
 
-def train_genome(genome: Genome, tokenizer, train_loader, device):
+
+def train_and_evaluate(genome: Genome, tokenizer, train_loader, device):
+    """Train a genome for TIME_BUDGET seconds, then evaluate with proper BPB."""
+    # Build model
     try:
         model = genome.build().to(device)
     except Exception as e:
         console.print(f"[red]Build failed: {e}[/red]")
         return float('inf'), 0
-    
+
     param_count = sum(p.numel() for p in model.parameters())
-    
     if param_count > MAX_PARAMS:
-        console.print(f"[yellow]Skipped: {param_count/1e6:.1f}M params > {MAX_PARAMS/1e6:.0f}M limit[/yellow]")
+        console.print(f"[yellow]Skipped: {param_count/1e6:.1f}M > {MAX_PARAMS/1e6:.0f}M[/yellow]")
         del model; torch.cuda.empty_cache()
         return float('inf'), param_count
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda")
-    
+
     model.train()
     start_time = time.time()
     steps = 0
-    
+
     try:
         while time.time() - start_time < TIME_BUDGET:
-            x, y, epoch = next(train_loader)
-            
-            lr = LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * (time.time() - start_time) / TIME_BUDGET))
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-                
+            x, y, _ = next(train_loader)
+            elapsed_frac = (time.time() - start_time) / TIME_BUDGET
+
+            # Warmup + cosine decay
+            if elapsed_frac < WARMUP_FRAC:
+                lr = LEARNING_RATE * (elapsed_frac / WARMUP_FRAC)
+            else:
+                decay_frac = (elapsed_frac - WARMUP_FRAC) / (1.0 - WARMUP_FRAC)
+                lr = LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * decay_frac))
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
+
             optimizer.zero_grad(set_to_none=True)
-            
+
             with torch.amp.autocast('cuda'):
                 loss = model(x, y)
-            
+
             if torch.isnan(loss) or torch.isinf(loss):
-                console.print(f"[red]NaN/Inf loss at step {steps}[/red]")
+                console.print(f"[red]NaN/Inf at step {steps}[/red]")
                 del model; del optimizer; torch.cuda.empty_cache()
                 return float('inf'), param_count
-                
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
             scaler.update()
-            
             steps += 1
-        
-        # Quick evaluation (not full prepare.evaluate_bpb — too slow for evolution)
+
+        # Proper evaluation using prepare.evaluate_bpb (same as autoresearch)
         model.eval()
-        val_loader = prepare.make_dataloader(tokenizer, BATCH_SIZE, prepare.MAX_SEQ_LEN, "val")
-        total_loss = 0.0
-        with torch.no_grad():
-            for _ in range(EVAL_STEPS):
-                x, y, _ = next(val_loader)
-                with torch.amp.autocast('cuda'):
-                    loss = model(x, y)
-                total_loss += loss.item()
-        
-        avg_loss = total_loss / EVAL_STEPS
-        # Convert cross-entropy loss to approximate BPB (nats -> bits, token-level)
-        val_bpb = avg_loss / math.log(2)
-        
-        console.print(f"[green]  {steps} steps, val_bpb≈{val_bpb:.4f}, {param_count/1e6:.2f}M params[/green]")
+        val_bpb = prepare.evaluate_bpb(model, tokenizer, BATCH_SIZE)
+        console.print(f"[green]  {steps} steps, val_bpb={val_bpb:.4f}, {param_count/1e6:.2f}M[/green]")
         return val_bpb, param_count
-        
+
     except Exception as e:
-        console.print(f"[red]Training error: {e}[/red]")
+        console.print(f"[red]Error: {e}[/red]")
         return float('inf'), param_count
     finally:
-        del model
-        del optimizer
+        del model, optimizer
         torch.cuda.empty_cache()
 
+
 def save_checkpoint(generation, population, history):
-    # population is list of (genome, fitness, params)
+    """Save full state for resume capability."""
     data = {
         "generation": generation,
+        "seed": SEED,
+        "config": {
+            "population_size": POPULATION_SIZE,
+            "survivors": SURVIVORS,
+            "time_budget": TIME_BUDGET,
+            "max_params": MAX_PARAMS,
+        },
         "history": history,
-        "population": [{"genome": g.to_dict(), "fitness": f, "params": p} for g, f, p in population]
+        "population": [
+            {"genome": g.to_dict(), "fitness": f, "params": p}
+            for g, f, p in population
+        ]
     }
     with open("results.json", "w") as f:
         json.dump(data, f, indent=2)
-    
-    # Save best genome
+
     if population:
         best_g, best_f, best_p = min(population, key=lambda x: x[1])
         with open("best_genome.json", "w") as f:
-            json.dump(best_g.to_dict(), f, indent=2)
+            json.dump({
+                "genome": best_g.to_dict(),
+                "val_bpb": best_f,
+                "params": best_p,
+                "summary": best_g.summary()
+            }, f, indent=2)
+
 
 def load_checkpoint():
     if os.path.exists("results.json"):
-        with open("results.json", "r") as f:
+        with open("results.json") as f:
             data = json.load(f)
-        generation = data["generation"]
+        gen = data["generation"]
         history = data["history"]
-        population = [(Genome.from_dict(d["genome"]), d["fitness"], d["params"]) for d in data["population"]]
-        return generation, population, history
+        population = [
+            (Genome.from_dict(d["genome"]), d["fitness"], d["params"])
+            for d in data["population"]
+        ]
+        return gen, population, history
     return 0, [], []
 
+
 def update_plot(history):
-    if not history: return
+    if not history:
+        return
     gens = [h["generation"] for h in history]
     best = [h["best_val_bpb"] for h in history]
     avg = [h["avg_val_bpb"] for h in history]
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(gens, best, label="Best BPB")
-    plt.plot(gens, avg, label="Avg BPB")
-    plt.xlabel("Generation")
-    plt.ylabel("BPB")
-    plt.title("Evolution Progress")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("progress.png")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    fig.patch.set_facecolor('#0d1117')
+    ax.set_facecolor('#0d1117')
+    ax.plot(gens, best, color='#58a6ff', linewidth=2.5, label='Best val_bpb', marker='o', markersize=3)
+    ax.plot(gens, avg, color='#8b949e', linewidth=1.5, label='Population avg', alpha=0.7, linestyle='--')
+    ax.fill_between(gens, best, avg, alpha=0.1, color='#58a6ff')
+
+    # Add baseline line if we have it
+    if "baseline_bpb" in history[0]:
+        baseline = history[0]["baseline_bpb"]
+        ax.axhline(y=baseline, color='#f85149', linestyle=':', linewidth=1.5,
+                   label=f'Transformer baseline ({baseline:.3f})')
+
+    ax.set_xlabel('Generation', color='#c9d1d9', fontsize=12)
+    ax.set_ylabel('val_bpb (lower is better)', color='#c9d1d9', fontsize=12)
+    ax.set_title('genesis — Neural Architecture Evolution', color='#e6edf3',
+                 fontsize=16, fontweight='bold', pad=15)
+    ax.tick_params(colors='#8b949e')
+    ax.spines['bottom'].set_color('#30363d')
+    ax.spines['left'].set_color('#30363d')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.15, color='#8b949e')
+    ax.legend(facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig('progress.png', dpi=150, facecolor='#0d1117', bbox_inches='tight')
     plt.close()
+
+
+def run_baseline(tokenizer, train_loader, device):
+    """Train a standard transformer baseline for comparison."""
+    console.rule("[bold yellow]Transformer Baseline[/bold yellow]")
+    genome = Genome.transformer_baseline(n_layers=2, dim=256)
+    params = genome.count_parameters()
+    console.print(f"Baseline: {genome.summary()} ({params/1e6:.2f}M params)")
+
+    if params > MAX_PARAMS:
+        # Reduce if too big
+        genome = Genome.transformer_baseline(n_layers=1, dim=256)
+        params = genome.count_parameters()
+        console.print(f"Reduced: {genome.summary()} ({params/1e6:.2f}M params)")
+
+    bpb, _ = train_and_evaluate(genome, tokenizer, train_loader, device)
+    console.print(f"[bold yellow]Transformer baseline val_bpb: {bpb:.4f}[/bold yellow]")
+    return bpb
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = prepare.Tokenizer.from_directory()
     train_loader = prepare.make_dataloader(tokenizer, BATCH_SIZE, prepare.MAX_SEQ_LEN, "train")
-    
+
     start_gen, population, history = load_checkpoint()
-    
+
+    # Run transformer baseline first
+    baseline_bpb = None
+    if not history:
+        baseline_bpb = run_baseline(tokenizer, train_loader, device)
+        console.print(f"\n[bold]Baseline established: {baseline_bpb:.4f} val_bpb[/bold]\n")
+
+    # Initialize random population
     if not population:
         console.print("[bold blue]Initializing random population...[/bold blue]")
-        for _ in range(POPULATION_SIZE):
-            population.append((Genome.random(), float('inf'), 0))
+        population = [(Genome.random(), float('inf'), 0) for _ in range(POPULATION_SIZE)]
 
     for gen in range(start_gen, MAX_GENERATIONS):
         console.rule(f"[bold green]Generation {gen}[/bold green]")
-        
-        # Evaluate population
+
         new_population = []
         with Progress(
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            console=console
+            BarColumn(), TimeElapsedColumn(), console=console
         ) as progress:
-            task = progress.add_task(f"Evaluating Gen {gen}...", total=POPULATION_SIZE)
-            
-            for i, (genome, fitness, params) in enumerate(population):
-                # Only train if not already trained in this generation (if we resumed)
+            task = progress.add_task(f"Gen {gen}...", total=len(population))
+
+            for genome, fitness, params in population:
                 if fitness == float('inf'):
-                    fit, p_count = train_genome(genome, tokenizer, train_loader, device)
+                    fit, p = train_and_evaluate(genome, tokenizer, train_loader, device)
                 else:
-                    fit, p_count = fitness, params
-                
-                new_population.append((genome, fit, p_count))
-                progress.update(task, advance=1, description=f"Gen {gen} | Best: {min([x[1] for x in new_population if x[1] != float('inf')] + [float('inf')]):.4f}")
+                    fit, p = fitness, params
+                new_population.append((genome, fit, p))
+
+                valid = [f for _, f, _ in new_population if f != float('inf')]
+                best_so_far = min(valid) if valid else float('inf')
+                progress.update(task, advance=1,
+                    description=f"Gen {gen} | Best: {best_so_far:.4f}")
 
         # Sort by fitness
         new_population.sort(key=lambda x: x[1])
-        
+
         # Stats
         valid_fits = [f for _, f, _ in new_population if f != float('inf')]
         best_fit = min(valid_fits) if valid_fits else float('inf')
         avg_fit = sum(valid_fits) / len(valid_fits) if valid_fits else float('inf')
-        
+
         # Log to TSV
         file_exists = os.path.isfile("results.tsv")
         with open("results.tsv", "a", newline="") as f:
             writer = csv.writer(f, delimiter="\t")
             if not file_exists:
-                writer.writerow(["generation", "best_val_bpb", "avg_val_bpb", "best_architecture_summary"])
-            
+                writer.writerow(["generation", "best_val_bpb", "avg_val_bpb", "best_params",
+                                "best_architecture", "baseline_bpb"])
             best_g = new_population[0][0]
-            summary = f"{len(best_g.genes)} layers: " + "->".join([g.op for g in best_g.genes])
-            writer.writerow([gen, f"{best_fit:.6f}", f"{avg_fit:.6f}", summary])
-            
-        history.append({
-            "generation": gen,
-            "best_val_bpb": best_fit,
-            "avg_val_bpb": avg_fit
-        })
-        
+            writer.writerow([gen, f"{best_fit:.6f}", f"{avg_fit:.6f}",
+                           f"{new_population[0][2]}", best_g.summary(),
+                           f"{baseline_bpb:.6f}" if baseline_bpb else ""])
+
+        entry = {"generation": gen, "best_val_bpb": best_fit, "avg_val_bpb": avg_fit}
+        if baseline_bpb:
+            entry["baseline_bpb"] = baseline_bpb
+        history.append(entry)
+
         update_plot(history)
-        
-        # Print Top-5
-        table = Table(title=f"Top 5 Genomes - Generation {gen}")
+
+        # Print top 5
+        table = Table(title=f"Top 5 — Generation {gen}")
         table.add_column("Rank", justify="right", style="cyan")
-        table.add_column("Fitness (BPB)", style="magenta")
+        table.add_column("val_bpb", style="magenta")
         table.add_column("Params", justify="right")
-        table.add_column("Architecture Summary")
-        
+        table.add_column("Architecture")
         for i, (g, f, p) in enumerate(new_population[:5]):
-            summary = f"{len(g.genes)}L: " + "->".join([gene.op[:4] for gene in g.genes])
-            table.add_row(str(i+1), f"{f:.4f}", f"{p/1e6:.2f}M", summary)
+            table.add_row(str(i+1), f"{f:.4f}", f"{p/1e6:.2f}M", g.summary())
         console.print(table)
-        
-        # Selection & Reproduction
+
+        if baseline_bpb:
+            delta = best_fit - baseline_bpb
+            color = "green" if delta < 0 else "red"
+            console.print(f"[{color}]vs baseline: {delta:+.4f} ({'BETTER' if delta < 0 else 'WORSE'})[/{color}]")
+
+        # Selection & reproduction
         survivors = new_population[:SURVIVORS]
-        next_gen = [copy.deepcopy(s) for s in survivors] # Elitism
-        
+        next_gen = [copy.deepcopy(s) for s in survivors]  # elitism
+
         while len(next_gen) < POPULATION_SIZE:
             if random.random() < CROSSOVER_RATE and len(survivors) >= 2:
                 p1, p2 = random.sample(survivors, 2)
@@ -235,11 +310,11 @@ def main():
             else:
                 parent = random.choice(survivors)
                 child = parent[0].mutate(rate=MUTATION_RATE)
-            
             next_gen.append((child, float('inf'), 0))
-            
+
         population = next_gen
         save_checkpoint(gen + 1, new_population, history)
+
 
 if __name__ == "__main__":
     main()
